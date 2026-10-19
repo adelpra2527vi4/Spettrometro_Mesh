@@ -1,0 +1,34 @@
+/* AS7341 (0x39) puo' stare su D4/D5 (i2c1, default scheda) oppure su D9/D10
+ * (P1.14 SDA / P1.15 SCL, i2c0 rimappato): il firmware prova entrambi all'avvio.
+ */
+&pinctrl {
+	i2c0_default: i2c0_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 14)>,
+				<NRF_PSEL(TWIM_SCL, 1, 15)>;
+		};
+	};
+
+	i2c0_sleep: i2c0_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 14)>,
+				<NRF_PSEL(TWIM_SCL, 1, 15)>;
+			low-power-enable;
+		};
+	};
+};
+
+&spi2 {
+	status = "disabled";
+};
+
+&qspi {
+	status = "disabled";
+};
+
+&i2c0 {
+	status = "okay";
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-1 = <&i2c0_sleep>;
+	pinctrl-names = "default", "sleep";
+};
