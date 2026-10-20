@@ -91,24 +91,33 @@ static int as_set_smux(const uint8_t *cfg)
 	return err ? err : -ETIMEDOUT;
 }
 
+/* Attende AVALID (dato spettrale pronto). */
+static int as_wait_data(void)
+{
+	for (int i = 0; i < 100; i++) {
+		uint8_t st;
+		int err;
+
+		k_msleep(10);
+		err = as_rd(AS_STATUS2, &st);
+		if (err || (st & 0x40)) {
+			return err;
+		}
+	}
+	return -ETIMEDOUT;
+}
+
 /* Misura 6 canali con la mappa SMUX data; out = 4 filtri, clear, NIR. */
 static int as_measure(const uint8_t *cfg, uint16_t out[6])
 {
-	uint8_t buf[12], st = 0;
+	uint8_t buf[12];
 	int err = as_set_smux(cfg);
 
 	if (!err) {
 		err = as_wr(AS_ENABLE, 0x03); /* PON | SP_EN */
 	}
-	for (int i = 0; !err && i < 100; i++) {
-		k_msleep(10);
-		err = as_rd(AS_STATUS2, &st);
-		if (!err && (st & 0x40)) { /* AVALID */
-			break;
-		}
-		if (i == 99) {
-			err = -ETIMEDOUT;
-		}
+	if (!err) {
+		err = as_wait_data();
 	}
 	if (!err) {
 		err = i2c_burst_read(as_bus, AS_ADDR, AS_CH0_L, buf, sizeof(buf));
@@ -239,6 +248,12 @@ static struct {
 	uint32_t ref_cl;	/* ultimo lux reale scritto dall'app (centilux) */
 } lux_cal = {.k = 1.0f, .ref_cl = LUX_CAL_UNKNOWN};
 
+/* Lux calibrati in centilux. */
+static int lux_centi(void)
+{
+	return (int)(cache.lux * lux_cal.k * 100.0f);
+}
+
 static int lux_cal_settings_set(const char *name, size_t len, settings_read_cb read_cb,
 				void *cb_arg)
 {
@@ -297,10 +312,14 @@ static const struct bt_mesh_sensor_setting lux_settings[] = {
 	},
 };
 
-static int lux_value(struct bt_mesh_sensor *sensor, struct bt_mesh_sensor_value *rsp)
+static int lux_get(struct bt_mesh_sensor_srv *srv, struct bt_mesh_sensor *sensor,
+		   struct bt_mesh_msg_ctx *ctx, struct bt_mesh_sensor_value *rsp)
 {
 	struct sensor_value v;
 
+	if (!cache.valid) {
+		return -EAGAIN;
+	}
 	sensor_value_from_float(&v, cache.lux * lux_cal.k);
 	int err = bt_mesh_sensor_value_from_sensor_value(sensor->type->channels[0].format, &v,
 							 rsp);
@@ -308,19 +327,28 @@ static int lux_value(struct bt_mesh_sensor *sensor, struct bt_mesh_sensor_value 
 	return (err && err != -ERANGE) ? err : 0;
 }
 
-static int cct_value(struct bt_mesh_sensor *sensor, struct bt_mesh_sensor_value *rsp)
+static int cct_get(struct bt_mesh_sensor_srv *srv, struct bt_mesh_sensor *sensor,
+		   struct bt_mesh_msg_ctx *ctx, struct bt_mesh_sensor_value *rsp)
 {
 	struct sensor_value v = {.val1 = cache.cct};
+
+	if (!cache.valid) {
+		return -EAGAIN;
+	}
 	int err = bt_mesh_sensor_value_from_sensor_value(sensor->type->channels[0].format, &v,
 							 rsp);
 
 	return (err && err != -ERANGE) ? err : 0;
 }
 
-static int chrom_value(struct bt_mesh_sensor *sensor, struct bt_mesh_sensor_value *rsp)
+static int chrom_get(struct bt_mesh_sensor_srv *srv, struct bt_mesh_sensor *sensor,
+		     struct bt_mesh_msg_ctx *ctx, struct bt_mesh_sensor_value *rsp)
 {
 	const float xy[2] = {cache.cx, cache.cy};
 
+	if (!cache.valid) {
+		return -EAGAIN;
+	}
 	for (int i = 0; i < 2; i++) {
 		struct sensor_value v;
 
@@ -335,38 +363,20 @@ static int chrom_value(struct bt_mesh_sensor *sensor, struct bt_mesh_sensor_valu
 	return 0;
 }
 
-static int lux_get(struct bt_mesh_sensor_srv *srv, struct bt_mesh_sensor *sensor,
-		   struct bt_mesh_msg_ctx *ctx, struct bt_mesh_sensor_value *rsp)
-{
-	return cache.valid ? lux_value(sensor, rsp) : -EAGAIN;
-}
-
-static int cct_get(struct bt_mesh_sensor_srv *srv, struct bt_mesh_sensor *sensor,
-		   struct bt_mesh_msg_ctx *ctx, struct bt_mesh_sensor_value *rsp)
-{
-	return cache.valid ? cct_value(sensor, rsp) : -EAGAIN;
-}
-
 static struct bt_mesh_sensor lux_sensor = {
 	.type = &bt_mesh_sensor_present_amb_light_level,
 	.get = lux_get,
 	.descriptor = &desc,
 	.settings = {.list = lux_settings, .count = ARRAY_SIZE(lux_settings)},
 };
-static int chrom_get(struct bt_mesh_sensor_srv *srv, struct bt_mesh_sensor *sensor,
-		     struct bt_mesh_msg_ctx *ctx, struct bt_mesh_sensor_value *rsp)
-{
-	return cache.valid ? chrom_value(sensor, rsp) : -EAGAIN;
-}
-
-static struct bt_mesh_sensor chrom_sensor = {
-	.type = &bt_mesh_sensor_present_cie_1931_chromaticity_coords,
-	.get = chrom_get,
-	.descriptor = &desc,
-};
 static struct bt_mesh_sensor cct_sensor = {
 	.type = &bt_mesh_sensor_present_correlated_col_temp,
 	.get = cct_get,
+	.descriptor = &desc,
+};
+static struct bt_mesh_sensor chrom_sensor = {
+	.type = &bt_mesh_sensor_present_cie_1931_chromaticity_coords,
+	.get = chrom_get,
 	.descriptor = &desc,
 };
 
@@ -396,10 +406,14 @@ static const struct bt_mesh_sensor_type spec_type = {
 	.channels = spec_channels,
 };
 
-static int spec_value(struct bt_mesh_sensor *sensor, struct bt_mesh_sensor_value *rsp)
+static int spec_get(struct bt_mesh_sensor_srv *srv, struct bt_mesh_sensor *sensor,
+		    struct bt_mesh_msg_ctx *ctx, struct bt_mesh_sensor_value *rsp)
 {
 	uint16_t raw[SPEC_CH];
 
+	if (!cache.valid) {
+		return -EAGAIN;
+	}
 	memcpy(raw, cache.ch, sizeof(cache.ch));
 	raw[8] = cache.clear;
 	raw[9] = cache.nir;
@@ -416,19 +430,14 @@ static int spec_value(struct bt_mesh_sensor *sensor, struct bt_mesh_sensor_value
 	return 0;
 }
 
-static int spec_get(struct bt_mesh_sensor_srv *srv, struct bt_mesh_sensor *sensor,
-		    struct bt_mesh_msg_ctx *ctx, struct bt_mesh_sensor_value *rsp)
-{
-	return cache.valid ? spec_value(sensor, rsp) : -EAGAIN;
-}
-
 static struct bt_mesh_sensor spec_sensor = {
 	.type = &spec_type,
 	.get = spec_get,
 	.descriptor = &desc,
 };
 
-static struct bt_mesh_sensor *const sensors[] = {&lux_sensor, &cct_sensor, &chrom_sensor, &spec_sensor};
+static struct bt_mesh_sensor *const sensors[] = {&lux_sensor, &cct_sensor, &chrom_sensor,
+						&spec_sensor};
 static struct bt_mesh_sensor_srv sensor_srv =
 	BT_MESH_SENSOR_SRV_INIT(sensors, ARRAY_SIZE(sensors));
 
@@ -651,7 +660,7 @@ static int cmd_status(const struct shell *sh, size_t argc, char **argv)
 		shell_print(sh, "indirizzo: 0x%04x", bt_mesh_primary_addr());
 	}
 	if (cache.valid) {
-		int cl = (int)(cache.lux * lux_cal.k * 100.0f);
+		int cl = lux_centi();
 
 		shell_print(sh, "%d.%02d lux (grezzo %d.%03d, k %d.%03d)  %u K  gain %u", cl / 100,
 			    cl % 100, (int)cache.lux, (int)((cache.lux - (int)cache.lux) * 1000),
@@ -674,27 +683,22 @@ SHELL_STATIC_SUBCMD_SET_CREATE(node_cmds,
 	SHELL_SUBCMD_SET_END);
 SHELL_CMD_REGISTER(node, &node_cmds, "Comandi nodo AS7341", NULL);
 
-
 /* ---- Campionamento / pubblicazione ------------------------------------ */
 
 static void publish_all(void)
 {
 	struct bt_mesh_sensor_value v[SPEC_CH];
-	struct bt_mesh_sensor *list[] = {&lux_sensor, &cct_sensor, &chrom_sensor, &spec_sensor};
 
 	if (!cache.valid || !bt_mesh_is_provisioned()) {
 		return;
 	}
-	for (int i = 0; i < ARRAY_SIZE(list); i++) {
-		int err = i == 0 ? lux_value(list[i], v) :
-			  i == 1 ? cct_value(list[i], v) :
-			  i == 2 ? chrom_value(list[i], v) : spec_value(list[i], v);
-
-		if (err) {
+	for (int i = 0; i < ARRAY_SIZE(sensors); i++) {
+		if (sensors[i]->get(&sensor_srv, sensors[i], NULL, v)) {
 			continue;
 		}
 		/* -EADDRNOTAVAIL = publicazione non ancora configurata: normale. */
-		err = bt_mesh_sensor_srv_pub(&sensor_srv, NULL, list[i], v);
+		int err = bt_mesh_sensor_srv_pub(&sensor_srv, NULL, sensors[i], v);
+
 		if (err && err != -EADDRNOTAVAIL) {
 			LOG_WRN("pub sensore %d err=%d", i, err);
 		}
@@ -710,7 +714,7 @@ static void sample_fn(struct k_work *w)
 	int err = as_sample();
 
 	if (err == 0) {
-		int cl = (int)(cache.lux * lux_cal.k * 100.0f);
+		int cl = lux_centi();
 
 		LOG_INF("%d.%02d lux  %u K  clear %u  gain %u", cl / 100, cl % 100, cache.cct,
 			cache.clear, cache.gain);
@@ -743,7 +747,8 @@ static void bt_ready(int err)
 	/* No-op se settings_load() ha ripristinato un provisioning. */
 	bt_mesh_prov_enable(BT_MESH_PROV_ADV | BT_MESH_PROV_GATT);
 	state = bt_mesh_is_provisioned() ? ST_PROV : ST_UNPROV;
-	LOG_INF("mesh pronta, %s", bt_mesh_is_provisioned() ? "provisionato" : "in attesa di provisioning");
+	LOG_INF("mesh pronta, %s",
+		bt_mesh_is_provisioned() ? "provisionato" : "in attesa di provisioning");
 }
 
 int main(void)
@@ -757,7 +762,6 @@ int main(void)
 	}
 	k_work_reschedule(&led_work, K_MSEC(LED_TICK_MS));
 	/* Prova D4/D5 (i2c1) poi D9/D10 (i2c0). */
-	/* Prova D4/D5 (i2c0) poi D9/D10 (i2c1). */
 	if (as_init(DEVICE_DT_GET(DT_NODELABEL(i2c1))) == 0) {
 		LOG_INF("AS7341 su i2c1 (D4/D5)");
 	} else if (as_init(DEVICE_DT_GET(DT_NODELABEL(i2c0))) == 0) {
