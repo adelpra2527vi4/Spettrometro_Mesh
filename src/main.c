@@ -146,6 +146,19 @@ static int as_init(const struct device *bus)
 	       as_wr(AS_CFG1, as_gain);
 }
 
+/* Prova D4/D5 (i2c1) poi D9/D10 (i2c0). */
+static bool as_probe(void)
+{
+	if (as_init(DEVICE_DT_GET(DT_NODELABEL(i2c1))) == 0) {
+		LOG_INF("AS7341 su i2c1 (D4/D5)");
+	} else if (as_init(DEVICE_DT_GET(DT_NODELABEL(i2c0))) == 0) {
+		LOG_INF("AS7341 su i2c0 (D9/D10)");
+	} else {
+		as_bus = NULL;
+	}
+	return as_bus != NULL;
+}
+
 /* CIE 1931 xbar/ybar/zbar alle lunghezze d'onda centrali di F1..F8 (415..680 nm). */
 static const float cie_x[8] = {0.044f, 0.336f, 0.096f, 0.036f, 0.514f, 1.026f, 0.642f, 0.047f};
 static const float cie_y[8] = {0.001f, 0.030f, 0.139f, 0.607f, 0.995f, 0.757f, 0.265f, 0.017f};
@@ -676,10 +689,40 @@ static int cmd_status(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+/* Scansione indirizzi 0x08..0x77 su entrambi i bus. */
+static int cmd_scan(const struct shell *sh, size_t argc, char **argv)
+{
+	const struct device *bus[] = {DEVICE_DT_GET(DT_NODELABEL(i2c1)),
+				      DEVICE_DT_GET(DT_NODELABEL(i2c0))};
+	const char *name[] = {"i2c1 (D4/D5)", "i2c0 (D9/D10)"};
+
+	for (int b = 0; b < ARRAY_SIZE(bus); b++) {
+		int n = 0;
+
+		uint8_t id = 0;
+		int rc;
+
+		shell_print(sh, "%s%s", name[b], device_is_ready(bus[b]) ? "" : " non pronto");
+		rc = i2c_reg_read_byte(bus[b], AS_ADDR, AS_ID, &id);
+		shell_print(sh, "  ID@0x39 rc=%d id=0x%02x", rc, id);
+		for (uint8_t a = 0x08; device_is_ready(bus[b]) && a < 0x78; a++) {
+			uint8_t d;
+
+			if (i2c_read(bus[b], &d, 1, a) == 0) {
+				shell_print(sh, "  0x%02x", a);
+				n++;
+			}
+		}
+		shell_print(sh, "  %d dispositivi", n);
+	}
+	return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(node_cmds,
 	SHELL_CMD(reset, NULL, "Reset mesh locale (torna provisionabile)", cmd_reset),
 	SHELL_CMD(dfu, NULL, "Riavvia nel bootloader (aggiornamento firmware)", cmd_dfu),
 	SHELL_CMD(status, NULL, "Stato nodo e ultima misura", cmd_status),
+	SHELL_CMD(scan, NULL, "Scansione I2C", cmd_scan),
 	SHELL_SUBCMD_SET_END);
 SHELL_CMD_REGISTER(node, &node_cmds, "Comandi nodo AS7341", NULL);
 
@@ -710,10 +753,16 @@ static K_WORK_DELAYABLE_DEFINE(sample_work, sample_fn);
 
 static void sample_fn(struct k_work *w)
 {
-	static int ticks;
+	static int ticks, fails;
+
+	if (!as_bus && !as_probe()) {
+		k_work_reschedule(&sample_work, K_SECONDS(SAMPLE_PERIOD_S));
+		return;
+	}
 	int err = as_sample();
 
 	if (err == 0) {
+		fails = 0;
 		int cl = lux_centi();
 
 		LOG_INF("%d.%02d lux  %u K  clear %u  gain %u", cl / 100, cl % 100, cache.cct,
@@ -724,6 +773,11 @@ static void sample_fn(struct k_work *w)
 		}
 	} else {
 		LOG_WRN("as_sample err=%d", err);
+		if (++fails >= 3) { /* sensore sparito o bloccato: invalida e riprova da capo */
+			fails = 0;
+			cache.valid = false;
+			as_bus = NULL;
+		}
 	}
 	k_work_reschedule(&sample_work, K_SECONDS(SAMPLE_PERIOD_S));
 }
@@ -761,18 +815,10 @@ int main(void)
 		}
 	}
 	k_work_reschedule(&led_work, K_MSEC(LED_TICK_MS));
-	/* Prova D4/D5 (i2c1) poi D9/D10 (i2c0). */
-	if (as_init(DEVICE_DT_GET(DT_NODELABEL(i2c1))) == 0) {
-		LOG_INF("AS7341 su i2c1 (D4/D5)");
-	} else if (as_init(DEVICE_DT_GET(DT_NODELABEL(i2c0))) == 0) {
-		LOG_INF("AS7341 su i2c0 (D9/D10)");
-	} else {
-		LOG_ERR("AS7341 non trovato (controlla cablaggio, 0x39)");
-		as_bus = NULL;
+	if (!as_probe()) {
+		LOG_ERR("AS7341 non trovato (controlla cablaggio, 0x39): riprovo ogni %d s", SAMPLE_PERIOD_S);
 	}
-	if (as_bus) {
-		k_work_reschedule(&sample_work, K_SECONDS(SAMPLE_PERIOD_S));
-	}
+	k_work_reschedule(&sample_work, K_SECONDS(SAMPLE_PERIOD_S));
 
 	/* UUID dal Device ID hardware, cosi' resta stabile tra i riavvii. */
 	uint8_t id[8];
